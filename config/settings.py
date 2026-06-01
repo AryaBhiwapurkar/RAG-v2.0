@@ -16,11 +16,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 class Settings(BaseSettings):
     # ── API Keys ──────────────────────────────────────────────────────────
-    google_api_key: str = "not_set"
     groq_api_key: str = "not_set"  
 
     # ── Model Names ───────────────────────────────────────────────────────
-    llm_model: str = "models/gemini-2.0-flash"  # Google Gemini Pro (2024-09-26)
+    llm_model: str = "llama-3.3-70b-versatile"
     embedding_model: str = "all-MiniLM-L6-v2"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 

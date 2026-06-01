@@ -187,7 +187,7 @@ def build_app() -> gr.Blocks:
 
         gr.Markdown("""
 # 📄 RAG V2 — Production Document Q&A
-**Hybrid retrieval** (BM25 + FAISS + RRF + cross-encoder rerank) · **Gemini 1.5 Flash** · **RAGAS evaluated**
+**Hybrid retrieval** (BM25 + FAISS + RRF + cross-encoder rerank) · **Groq Llama 3.3 70B** · **RAGAS evaluated**
 
 > ⚠️ **Session-based:** Documents persist until server restart. Re-upload after page refresh.
         """)

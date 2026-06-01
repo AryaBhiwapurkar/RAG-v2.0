@@ -28,7 +28,7 @@ app = FastAPI(
     description=(
         "Production-grade document Q&A system. "
         "Hybrid retrieval (BM25 + FAISS + RRF + rerank), "
-        "Gemini 1.5 Flash, RAGAS evaluation."
+        "Groq Llama 3.3 70B, RAGAS evaluation."
     ),
     version="2.0.0",
 )

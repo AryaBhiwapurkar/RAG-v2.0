@@ -1,134 +1,105 @@
-# RAG V2 — Production Document Q&A System
+# RAG V2 - Document Q&A System
 
-**Arya Mahesh Bhiwapurkar · IIIT Naya Raipur · May 2026**
-
-Upgraded from a basic LangChain tutorial prototype to a production-grade, metrics-driven, multi-document Q&A platform.
-
----
+Production-style multi-document Q&A app with PDF ingestion, hybrid retrieval, reranking, semantic cache, latency metrics, FastAPI backend, and Gradio UI.
 
 ## Architecture
 
-```
+```text
 User Question
-    ↓
-[Semantic Cache] ──── hit ────→ Return cached answer
-    ↓ miss
-[Query Embedding]  text-embedding-004 → 768-dim vector
-    ↓
-┌─────────────────────────────────┐
-│  BM25 (sparse)  FAISS (dense)   │  top-20 each
-└──────────────┬──────────────────┘
-               ↓
-          [RRF Fusion]             top-20 deduplicated
-               ↓
-      [Cross-Encoder Rerank]       top-4 final chunks
-               ↓
-       [Parent Lookup]             small → large chunks
-               ↓
-     [Gemini 1.5 Flash]            structured prompt
-               ↓
-   [Faithfulness Post-Check]       flag low-confidence
-               ↓
-          Response
+    |
+[Semantic Cache] -- hit --> Return cached answer
+    |
+  miss
+    |
+[Query Embedding] all-MiniLM-L6-v2
+    |
+[BM25 sparse search] + [FAISS dense search]
+    |
+[RRF Fusion]
+    |
+[Cross-Encoder Rerank]
+    |
+[Parent Chunk Lookup]
+    |
+[Groq Llama 3.3 70B]
+    |
+Response + sources + latency/token metadata
 ```
 
-## Stack (All Free)
+## Stack
 
-| Layer | Tool | Purpose |
-|-------|------|---------|
-| LLM | Gemini 1.5 Flash | Text generation |
-| Embeddings | text-embedding-004 (768-dim) | Semantic vectors |
-| Vector Store | FAISS IndexFlatL2 | Dense similarity search |
-| Sparse | rank-bm25 | Keyword retrieval |
-| Reranker | ms-marco-MiniLM-L-6-v2 | Cross-encoder reranking |
-| PDF Parsing | pdfplumber | Text + table extraction |
-| Evaluation | RAGAS | Quality metrics |
-| Backend | FastAPI (async) | API endpoints |
-| Frontend | Gradio | Browser UI |
-| Deployment | Hugging Face Spaces | Free hosting |
+| Layer | Tool |
+| --- | --- |
+| LLM | Groq, `llama-3.3-70b-versatile` |
+| Embeddings | Sentence Transformers, `all-MiniLM-L6-v2` |
+| Vector search | FAISS |
+| Sparse search | rank-bm25 |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| PDF parsing | pdfplumber |
+| Backend | FastAPI |
+| Frontend | Gradio |
+| Evaluation | RAGAS |
 
 ## Setup
 
 ```bash
-# 1. Clone and install
-git clone <repo-url>
-cd rag-v2
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Set API key
 cp .env.example .env
-# Edit .env and add your GOOGLE_API_KEY
+# Add GROQ_API_KEY in .env
+```
 
-# 3. Start backend
+## Run
+
+Start the API:
+
+```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
 
-# 4. Start UI (separate terminal)
+Start the UI in another terminal:
+
+```bash
 python ui/app.py
 ```
 
-Visit `http://localhost:7860` for the UI, `http://localhost:8000/docs` for the API.
+Open:
 
-## Key Design Decisions
+- UI: `http://localhost:7860`
+- API docs: `http://localhost:8000/docs`
+- Health check: `http://localhost:8000/health`
 
-**Framework-light:** No LangChain in the core pipeline. All chunking, retrieval, and generation use direct API calls. RAGAS (eval only) uses LangChain internally but is isolated to `evaluation/`.
+## API
 
-**Parent-child chunking:** Small chunks (300 chars) indexed for precision. Large parent chunks (1200 chars) sent to LLM for rich context.
+All main routes are under `/api/v2`:
 
-**Hybrid retrieval:** BM25 catches exact term matches; FAISS catches semantic similarity. RRF fuses rankings without score normalisation. Cross-encoder reranks top-20 to top-4.
-
-**Per-document FAISS:** Each document gets its own index. Delete one without rebuilding others.
-
-**Semantic cache:** Cosine similarity > 0.92 = cache hit. Handles paraphrased questions. ~40% LLM call reduction.
-
-**Faithfulness gate:** Post-generation check flags low-confidence answers before they reach the user.
-
-## Metrics (fill after Day 5)
-
-| Metric | V1 Baseline | V2 Target | V2 Actual |
-|--------|-------------|-----------|-----------|
-| Faithfulness | ? | >0.85 | ? |
-| Answer Relevancy | ? | >0.80 | ? |
-| Context Precision | ? | >0.75 | ? |
-| Context Recall | ? | >0.80 | ? |
-| P95 Total Latency | ? | <2000ms | ? |
-| P95 Retrieval | ? | <200ms | ? |
-| Cache Hit Rate | N/A | >30% | ? |
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | `/api/v2/ingest` | Upload a PDF and start background ingestion |
+| GET | `/api/v2/documents` | List ingested documents and statuses |
+| POST | `/api/v2/query` | Ask a question over ready documents |
+| GET | `/api/v2/metrics` | View latency, cache, and token metrics |
 
 ## Project Structure
 
-```
+```text
 rag-v2/
-├── config/settings.py          # All constants — single source of truth
-├── core/
-│   ├── embedder.py             # text-embedding-004 wrapper
-│   ├── preprocessor.py         # Query cleaning for BM25
-│   ├── chunker.py              # Parent-child chunking
-│   ├── retriever.py            # BM25 + FAISS + RRF + rerank
-│   └── generator.py            # Gemini generation + faithfulness check
-├── storage/
-│   ├── vector_store.py         # Per-doc FAISS index management
-│   └── cache.py                # Semantic in-memory cache
-├── pipeline/
-│   ├── ingest.py               # PDF → indexed chunks (async)
-│   └── query.py                # Question → answer orchestration
-├── evaluation/
-│   ├── ragas_eval.py           # RAGAS metrics wrapper
-│   └── latency_tracker.py      # P50/P95/P99 tracking
-├── api/
-│   ├── models.py               # Pydantic schemas
-│   └── routes.py               # FastAPI endpoints
-├── ui/app.py                   # Gradio frontend
-├── main.py                     # FastAPI app entrypoint
-└── data/
-    ├── uploads/                # Uploaded PDFs
-    ├── indexes/                # Per-document FAISS indexes
-    └── doc_registry.json       # Document metadata
+├── api/                  # FastAPI request/response models and routes
+├── config/settings.py    # Runtime settings and paths
+├── core/                 # Chunking, embeddings, retrieval, generation
+├── data/                 # Local registry plus ignored uploads/indexes/cache
+├── evaluation/           # RAGAS and latency tracking
+├── pipeline/             # Ingestion and query orchestration
+├── storage/              # FAISS/BM25 persistence and semantic cache
+├── ui/app.py             # Gradio frontend
+├── main.py               # FastAPI app entrypoint
+└── requirements.txt
 ```
 
-## Interview Answer: LangChain?
+## Notes
 
-> "I deliberately excluded LangChain from the core pipeline. Chunking, retrieval, and generation are all direct API calls so I can explain and debug every step. For example, my hybrid retrieval calls FAISS and BM25 directly, fuses with RRF manually, then passes through the cross-encoder reranker before calling Gemini. I only use RAGAS for evaluation — which uses LangChain internally but that's isolated to the eval module, not my pipeline."
-
-## Interview Answer: Scale to 1M docs?
-
-> "Three main changes: (1) Replace FAISS IndexFlatL2 (exact O(n)) with Pinecone using HNSW index — O(log n) approximate search. (2) Replace synchronous ingestion with Celery + Redis worker queue, PDFs on S3. (3) Add PostgreSQL for doc registry with metadata filtering, Redis for shared cache across API replicas. The retrieval algorithm stays the same — it's stateless and scales horizontally."
+- Uploaded PDFs, generated indexes, cache files, `.env`, and virtualenv files are intentionally ignored by Git.
+- `data/doc_registry.json` is kept as the local document registry seed.
+- RAGAS is isolated to `evaluation/`; the core retrieval/generation pipeline does not depend on LangChain.
