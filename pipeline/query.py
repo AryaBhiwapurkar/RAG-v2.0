@@ -6,32 +6,47 @@ FLOW (per user question):
     ↓ cache.py: semantic lookup (cosine > 0.92 → return cached result)
     ↓ embedder.py: embed query → 768-dim vector
     ↓ load indexes for requested doc_ids
-    ↓ retriever.py: BM25 + FAISS + RRF + rerank → top-4 large chunks
-    ↓ generator.py: structured prompt + Gemini 1.5 Flash → answer
+    ↓ retriever.py: BM25 + FAISS + RRF + rerank → top-k small chunks
+    ↓ [multi-doc only] global cross-encoder rerank on small chunks → top-4
+    ↓ parent lookup → swap small chunks → large parent chunks (300→1200 chars)
+    ↓ generator.py: structured prompt + Groq LLM → answer
     ↓ faithfulness post-check
     ↓ cache.py: store result
     ↓ latency_tracker.py: record timing
     ↓ Return: answer + sources + latency + faithfulness flag
 
-MULTI-DOC SUPPORT:
-  If doc_ids is a list of multiple doc IDs, we retrieve from each
-  document's index independently, then pool all retrieved chunks
-  and pass the combined context to the LLM.
-  This is simple and effective at our scale (10-20 docs).
-  At V3 scale (1M docs), you'd need filtered vector DB search instead.
+MULTI-DOC BALANCE FIX (Phase 1):
+  OLD: each doc returned top-4 large chunks → big docs drowned small docs.
+       Final limit was a dumb slice with no reranking.
+  NEW: each doc returns top-2 small chunks (_PER_DOC_TOP_K).
+       Global cross-encoder rerank on small chunks → final top-4 small chunks.
+       Parent lookup done ONCE after global rerank.
+       Small docs guaranteed representation; best chunks win globally.
+
+PHASE 2 FIX (cross-encoder input size):
+  OLD: global rerank scored (query, parent_chunk) — 1200 chars, out of
+       distribution for ms-marco which was trained on ~300 char passages.
+  NEW: global rerank scores (query, small_chunk) — 300 chars, correct usage.
+       Parent lookup moved to after global rerank so context richness is
+       still preserved for the LLM.
 """
 
 import time
 import logging
 from config.settings import settings
 from core.embedder import embed_text
-from core.retriever import hybrid_retrieve
+from core.retriever import hybrid_retrieve, rerank as cross_rerank, get_parent_chunks
 from core.generator import generate_answer
 from storage.vector_store import load_index, index_exists
 from storage.cache import get_cache
 from evaluation.latency_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
+
+# Each doc contributes this many small chunks before the global rerank.
+# Keeps small docs from being drowned by large ones.
+# Tune if you add more documents — e.g. 10 docs → consider top-1 per doc.
+_PER_DOC_TOP_K = 2
 
 
 def run_query(
@@ -65,7 +80,6 @@ def run_query(
 
     # ── Resolve doc_ids ────────────────────────────────────────────────────
     if doc_ids is None or len(doc_ids) == 0:
-        # Search all available documents
         from pipeline.ingest import get_registry
         registry = get_registry()
         doc_ids = [
@@ -98,9 +112,13 @@ def run_query(
         tracker.record(total_ms, cached.get("retrieval_latency_ms", 0))
         return cached
 
-    # ── Retrieval (one index per doc, pool results) ─────────────────────────
+    # ── Retrieval ───────────────────────────────────────────────────────────
     t_retrieval_start = time.time()
-    all_context_chunks = []
+    is_multi_doc = len(doc_ids) > 1
+
+    # We need large_chunks later for parent lookup — store per doc_id
+    all_small_chunks: list[dict] = []
+    large_chunks_registry: dict[str, dict] = {}  # parent_id → large chunk, across all docs
 
     for doc_id in doc_ids:
         if not index_exists(doc_id):
@@ -109,27 +127,77 @@ def run_query(
 
         try:
             faiss_index, bm25_index, small_chunks, large_chunks = load_index(doc_id)
-            doc_chunks = hybrid_retrieve(
-                query=question,
-                query_vector=query_vector,
-                faiss_index=faiss_index,
-                bm25_index=bm25_index,
-                small_chunks=small_chunks,
-                large_chunks=large_chunks,
-            )
-            all_context_chunks.extend(doc_chunks)
+
+            if is_multi_doc:
+                # Return small chunks so global rerank scores them correctly
+                # (300 chars — what ms-marco was trained on, not 1200 char parents)
+                doc_small = hybrid_retrieve(
+                    query=question,
+                    query_vector=query_vector,
+                    faiss_index=faiss_index,
+                    bm25_index=bm25_index,
+                    small_chunks=small_chunks,
+                    large_chunks=large_chunks,
+                    override_rerank_top_k=_PER_DOC_TOP_K,
+                    return_small_chunks=True,   # ← skip parent lookup here
+                )
+                all_small_chunks.extend(doc_small)
+                large_chunks_registry.update(large_chunks)  # accumulate for later
+            else:
+                # Single doc: normal path — parent lookup inside hybrid_retrieve
+                doc_chunks = hybrid_retrieve(
+                    query=question,
+                    query_vector=query_vector,
+                    faiss_index=faiss_index,
+                    bm25_index=bm25_index,
+                    small_chunks=small_chunks,
+                    large_chunks=large_chunks,
+                )
+                all_small_chunks = doc_chunks  # already large chunks for single doc
+
         except Exception as e:
             logger.error(f"Retrieval failed for doc_id='{doc_id}': {e}")
             continue
 
     retrieval_ms = (time.time() - t_retrieval_start) * 1000
     logger.info(
-        f"Retrieval complete: {len(all_context_chunks)} context chunks "
+        f"Retrieval complete: {len(all_small_chunks)} candidates "
         f"from {len(doc_ids)} docs in {retrieval_ms:.0f}ms"
     )
 
-    # If multi-doc, limit total context to rerank_top_k chunks to avoid
-    # overwhelming the LLM with too much context
+    # ── Global rerank + parent lookup (multi-doc only) ──────────────────────
+    if is_multi_doc and len(all_small_chunks) > 0:
+        # Global cross-encoder rerank on small chunks (300 chars) — correct
+        # input size for ms-marco. Picks best top-4 across all docs.
+        candidates = [(i, 0.0) for i in range(len(all_small_chunks))]
+        logger.debug(f"Accumulated large_chunks_registry: {len(large_chunks_registry)} parents")
+        logger.debug(f"All small chunks before global rerank: {len(all_small_chunks)}")
+        top_small = cross_rerank(
+            question,
+            candidates,
+            all_small_chunks,
+            settings.rerank_top_k,
+        )
+        logger.info(
+            f"Global rerank: {len(all_small_chunks)} candidates → "
+            f"top-{len(top_small)} after cross-encoder"
+        )
+        logger.debug(f"Top small after global rerank: {len(top_small)}")
+        # Now do parent lookup once on the globally-ranked small chunks
+        all_context_chunks = get_parent_chunks(top_small, large_chunks_registry)
+        # Fallback: if parent lookup failed to return any parents (edge cases
+        # where large_chunks_registry may be missing keys), use the reranked
+        # small chunks as context so the LLM still receives useful text.
+        if not all_context_chunks:
+            logger.warning(
+                "Multi-doc parent lookup returned 0 parents — falling back to using small chunks as context"
+            )
+            all_context_chunks = top_small
+    else:
+        # Single doc: all_small_chunks is already large chunks from hybrid_retrieve
+        all_context_chunks = all_small_chunks
+
+    # Final safety cap (shouldn't trigger normally but guards edge cases)
     if len(all_context_chunks) > settings.rerank_top_k:
         all_context_chunks = all_context_chunks[:settings.rerank_top_k]
 

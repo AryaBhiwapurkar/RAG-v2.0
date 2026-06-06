@@ -1,34 +1,30 @@
 """
-api/routes.py — FastAPI router: /ingest, /query, /documents, /metrics.
+api/routes.py
 
-WHY FASTAPI (not Flask or Gradio-only):
-  - Async support (async def) → non-blocking I/O → handles concurrent requests
-  - BackgroundTasks → ingest runs after HTTP response is sent → no UI blocking
-  - Pydantic validation → automatic 422 errors for bad requests
-  - Auto OpenAPI docs at /docs → free, no extra work
+PHASE 3 FIX — Async ingestion properly wired:
+  - ingest_document() is sync (CPU-bound: PDF parsing, embedding, FAISS).
+    Running it directly in BackgroundTasks blocks the event loop.
+    Fix: asyncio.to_thread() pushes it to a thread pool, freeing the event loop.
+  - Bulk ingestion uses asyncio.gather() — all files run concurrently in threads.
+  - run_query() also pushed to thread (same reason — CPU-bound retrieval + LLM).
 
-ENDPOINTS:
-  POST /ingest    — Upload a PDF, start background ingestion
-  POST /query     — Ask a question, get an answer
-  GET  /documents — List all ingested documents and their status
-  GET  /metrics   — Latency + cache stats
-
-ASYNC INGESTION FLOW:
-  1. Client POSTs PDF → server saves file, returns 202 with doc_id immediately
-  2. Ingestion runs in background (chunking, embedding, indexing)
-  3. Client polls GET /documents to check when status = "ready"
-  4. Once ready, client can query
+PHASE 3 FIX — Import fix:
+  - get_registry() moved from pipeline.ingest to storage.registry (SQLite).
 """
 
 import shutil
 import logging
+import time
+import re
+import asyncio
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 from api.models import (
-    QueryRequest, QueryResponse, IngestResponse,
+    QueryRequest, QueryResponse, IngestResponse, BulkIngestResponse,
     DocumentListResponse, DocumentInfo, MetricsResponse, TokenUsage
 )
-from pipeline.ingest import ingest_document, get_registry
+from pipeline.ingest import ingest_document
+from storage.registry import get_registry
 from pipeline.query import run_query
 from storage.cache import get_cache
 from evaluation.latency_tracker import get_tracker
@@ -37,71 +33,123 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+MAX_QUERY_LENGTH = 512
 
-# ── POST /ingest ───────────────────────────────────────────────────────────────
+_INJECTION_PATTERNS = re.compile(
+    r"ignore (above|previous|all|prior) (instructions?|prompts?|context)|"
+    r"jailbreak|DAN mode|you are now|disregard (your|all)|"
+    r"forget (your|all) (instructions?|rules?)|"
+    r"act as (an? )?(unrestricted|unfiltered|evil|dan)",
+    re.IGNORECASE,
+)
+
+
+def _validate_query(question: str) -> None:
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if len(question) > MAX_QUERY_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question too long ({len(question)} chars). Keep it under {MAX_QUERY_LENGTH}.",
+        )
+    if _INJECTION_PATTERNS.search(question):
+        raise HTTPException(
+            status_code=400,
+            detail="Question contains disallowed patterns. Please ask a normal question.",
+        )
+
 
 @router.post("/ingest", response_model=IngestResponse, status_code=202)
 async def ingest(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
-    """
-    Upload a PDF and start background ingestion.
-
-    Returns immediately with doc_id and status="processing".
-    Poll GET /documents to check when status="ready".
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Save uploaded file to disk
     save_path = settings.uploads_dir / file.filename
     with open(save_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Start ingestion in background (non-blocking)
-    # ingest_document will update the registry as it progresses
-    background_tasks.add_task(ingest_document, save_path, file.filename)
-
-    logger.info(f"Queued ingestion for '{file.filename}'")
+    # asyncio.to_thread: runs sync ingest_document in a thread pool.
+    # Without this, BackgroundTasks runs it on the event loop → blocks all requests.
+    background_tasks.add_task(asyncio.to_thread, ingest_document, save_path, file.filename)
+    logger.info(f"Queued async ingestion for '{file.filename}'")
 
     return IngestResponse(
-        doc_id="pending",   # Will be assigned by ingest_document
+        doc_id="pending",
         filename=file.filename,
         status="processing",
-        message=(
-            f"'{file.filename}' is being processed. "
-            "Poll GET /documents to check when status='ready'."
-        ),
+        message=f"'{file.filename}' is being processed. Poll GET /documents to check when status='ready'.",
     )
 
 
-# ── POST /query ────────────────────────────────────────────────────────────────
+@router.post("/ingest-bulk", response_model=BulkIngestResponse, status_code=202)
+async def ingest_bulk(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    for file in files:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"Only PDFs supported. Got: {file.filename}")
+
+    save_paths = []
+    for file in files:
+        save_path = settings.uploads_dir / file.filename
+        with open(save_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        save_paths.append((save_path, file.filename))
+
+    background_tasks.add_task(_ingest_parallel, save_paths)
+    logger.info(f"[BULK INGEST] Queued {len(files)} files")
+
+    return BulkIngestResponse(
+        files_count=len(files),
+        status="processing",
+        message=f"{len(files)} files queued. Poll GET /documents to check progress.",
+    )
+
+
+async def _ingest_parallel(save_paths: list[tuple]) -> None:
+    """
+    Fan out all ingestions concurrently.
+    Each ingest_document() runs in its own thread via asyncio.to_thread().
+    asyncio.gather() launches all threads simultaneously — no sequential waiting.
+    """
+    t_start = time.time()
+
+    async def _one(save_path, filename):
+        try:
+            result = await asyncio.to_thread(ingest_document, save_path, filename)
+            icon = "✅" if result.get("status") == "ready" else "❌"
+            logger.info(f"[BULK] {icon} {filename}")
+            return result
+        except Exception as e:
+            logger.error(f"[BULK] ❌ {filename}: {e}")
+            return {"filename": filename, "status": "failed", "error": str(e)}
+
+    results = await asyncio.gather(*[_one(sp, fn) for sp, fn in save_paths])
+    elapsed = time.time() - t_start
+    ok = sum(1 for r in results if r.get("status") == "ready")
+    logger.info(f"[BULK] Done: {ok}/{len(results)} in {elapsed:.1f}s")
+
 
 @router.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
-    """
-    Ask a question against ingested documents.
+    _validate_query(request.question)
 
-    If doc_ids is null, searches all ready documents.
-    Returns answer with latency, source, and faithfulness metadata.
-    """
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    # run_query is sync + CPU-bound — push to thread to free event loop
+    result = await asyncio.to_thread(run_query, request.question, request.doc_ids)
 
-    result = run_query(
-        question=request.question,
-        doc_ids=request.doc_ids,
-    )
-
-    # Build confidence message for UI display
     flag = result.get("faithfulness_flag", "high")
     confidence_messages = {
-        "high": None,  # No message needed — show answer normally
-        "medium": "Confidence: Medium — please verify this answer against the source document.",
-        "low": "Low confidence — I couldn't find a reliable answer. Please check the document directly.",
+        "high": None,
+        "medium": "Confidence: Medium — please verify against the source document.",
+        "low": "Low confidence — I couldn't find a reliable answer. Check the document directly.",
     }
-
     token_usage = result.get("token_usage", {})
 
     return QueryResponse(
@@ -123,18 +171,8 @@ async def query(request: QueryRequest):
     )
 
 
-# ── GET /documents ─────────────────────────────────────────────────────────────
-
 @router.get("/documents", response_model=DocumentListResponse)
 async def list_documents():
-    """
-    List all documents and their ingestion status.
-
-    Status values:
-      "processing" — ingestion in progress
-      "ready"      — fully indexed, queryable
-      "failed"     — ingestion failed (see error field)
-    """
     registry = get_registry()
     documents = [
         DocumentInfo(
@@ -151,21 +189,10 @@ async def list_documents():
     return DocumentListResponse(documents=documents, total=len(documents))
 
 
-# ── GET /metrics ───────────────────────────────────────────────────────────────
-
 @router.get("/metrics", response_model=MetricsResponse)
 async def get_metrics():
-    """
-    Latency percentiles and cache statistics.
-
-    Use this to track:
-      - P95 total latency (target: <2000ms)
-      - P95 retrieval latency (target: <200ms)
-      - Cache hit rate (target: >30%)
-    """
     tracker = get_tracker()
     cache = get_cache()
-
     latency_stats = tracker.stats
     cache_stats = cache.stats
 

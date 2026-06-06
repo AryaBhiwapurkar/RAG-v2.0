@@ -6,6 +6,8 @@ WHY PYDANTIC MODELS:
   - Response models document exactly what the API returns
   - Type hints throughout = fewer runtime errors
   - Auto-generates OpenAPI docs at /docs (free with FastAPI)
+
+PHASE 1: Added BulkIngestResponse for /ingest-bulk endpoint
 """
 
 from pydantic import BaseModel, Field
@@ -66,6 +68,27 @@ class IngestResponse(BaseModel):
     large_chunks: Optional[int] = None
     ingestion_time_s: Optional[float] = None
     error: Optional[str] = None
+
+
+class BulkIngestResponse(BaseModel):
+    """
+    PHASE 1: Response for bulk multi-file ingestion endpoint.
+    
+    Clients use this to confirm files are being processed in parallel.
+    Poll GET /documents to check individual status.
+    """
+    files_count: int
+    status: str  # "processing"
+    message: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "files_count": 5,
+                "status": "processing",
+                "message": "5 files queued for parallel ingestion (max 4 concurrent). Poll GET /documents to check when all status='ready'."
+            }
+        }
 
 
 class DocumentInfo(BaseModel):

@@ -4,32 +4,41 @@ core/retriever.py — Hybrid retrieval: BM25 + FAISS + RRF + cross-encoder reran
 PIPELINE:
   Query
     ↓
-  [BM25 sparse search]    → top-20 by keyword score
-  [FAISS dense search]    → top-20 by semantic similarity
-    ↓
+  [BM25 sparse search]    → top-10 by keyword score        ← PHASE 1: was 20
+  [FAISS dense search]    → top-10 by semantic similarity  ← PHASE 1: was 20
+    ↓ (parallel via ThreadPoolExecutor)                    ← PHASE 1: new
   [RRF fusion]            → combine rankings → top-20 deduplicated
     ↓
-  [Cross-encoder rerank]  → re-score top-20 jointly → top-4
+  [Cross-encoder rerank]  → re-score top-20 jointly → top-k
     ↓
   [Parent lookup]         → swap small chunks → large parent chunks
     ↓
-  Final 4 large chunks → sent to LLM
+  Final chunks → sent to LLM
 
-WHY EACH STAGE:
-  BM25   — catches exact term matches (codes, names, numbers, abbreviations)
-  FAISS  — catches semantic similarity (synonyms, paraphrases, intent)
-  RRF    — rank-based fusion, no score normalisation needed
-  Rerank — cross-encoder sees (query, chunk) jointly → most accurate scoring
-  Parent — small chunks retrieved, large chunks generated (context quality)
+PHASE 1 CHANGES:
+  - BM25 + FAISS run in parallel (ThreadPoolExecutor) instead of sequentially.
+  - Phase-wise timing on every stage.
+  - override_rerank_top_k param wired up (was in signature but ignored before).
+
+PHASE 2 FIX:
+  - return_small_chunks param added to hybrid_retrieve().
+    When True, skips parent lookup and returns small chunks instead.
+    Used by query.py in multi-doc mode so the global cross-encoder rerank
+    scores (query, small_chunk) pairs — what the model was trained on (300
+    chars) — rather than (query, parent_chunk) pairs (1200 chars, out of
+    distribution). Parent lookup happens once at the end in query.py after
+    global rerank, so context richness is preserved.
 
 RRF FORMULA:
   score(chunk) = Σ  1 / (k + rank_i)
   where k=60 (prevents top rank from dominating), rank_i = position in list i
 """
 
+import time
 import numpy as np
 import logging
 import faiss
+from concurrent.futures import ThreadPoolExecutor
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from config.settings import settings
@@ -37,15 +46,18 @@ from core.preprocessor import preprocess_query
 
 logger = logging.getLogger(__name__)
 
-# Load cross-encoder once at module import (heavy model, don't reload per query)
 _reranker: CrossEncoder | None = None
+
+_search_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="retriever")
 
 
 def _get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
-        logger.info(f"Loading cross-encoder: {settings.reranker_model}")
+        logger.info(f"[RETRIEVER] Loading cross-encoder: {settings.reranker_model}")
+        t0 = time.perf_counter()
         _reranker = CrossEncoder(settings.reranker_model)
+        logger.info(f"[RETRIEVER] Cross-encoder loaded in {(time.perf_counter()-t0)*1000:.0f}ms")
     return _reranker
 
 
@@ -57,19 +69,7 @@ def dense_search(
     small_chunks: list[dict],
     top_k: int,
 ) -> list[tuple[int, float]]:
-    """
-    FAISS semantic similarity search.
-
-    Args:
-        query_vector: 768-dim query embedding (will be normalised).
-        faiss_index: Loaded FAISS index for this document.
-        small_chunks: List of chunk dicts (same order as FAISS index).
-        top_k: Number of results to return.
-
-    Returns:
-        List of (chunk_index, distance) sorted by distance ascending (lower=better).
-    """
-    # Normalise query vector (vectors in index are also normalised)
+    """FAISS semantic similarity search."""
     q = query_vector.copy().reshape(1, -1).astype(np.float32)
     faiss.normalize_L2(q)
 
@@ -79,9 +79,9 @@ def dense_search(
     results = [
         (int(idx), float(dist))
         for idx, dist in zip(indices[0], distances[0])
-        if idx >= 0  # FAISS returns -1 for empty slots
+        if idx >= 0
     ]
-    logger.debug(f"FAISS returned {len(results)} candidates")
+    logger.debug(f"[RETRIEVER] FAISS: {len(results)} candidates")
     return results
 
 
@@ -91,28 +91,15 @@ def sparse_search(
     small_chunks: list[dict],
     top_k: int,
 ) -> list[tuple[int, float]]:
-    """
-    BM25 keyword search.
-
-    Args:
-        query: Raw query string (will be preprocessed internally).
-        bm25_index: Fitted BM25Okapi instance.
-        small_chunks: List of chunk dicts (same order as BM25 corpus).
-        top_k: Number of results to return.
-
-    Returns:
-        List of (chunk_index, bm25_score) sorted by score descending.
-    """
+    """BM25 keyword search."""
     preprocessed = preprocess_query(query)
     tokens = preprocessed.lower().split()
 
-    scores = bm25_index.get_scores(tokens)  # Shape: (n_chunks,)
-
-    # Get top-k indices sorted by score descending
+    scores = bm25_index.get_scores(tokens)
     top_indices = np.argsort(scores)[::-1][:top_k]
     results = [(int(i), float(scores[i])) for i in top_indices if scores[i] > 0]
 
-    logger.debug(f"BM25 returned {len(results)} candidates with score > 0")
+    logger.debug(f"[RETRIEVER] BM25: {len(results)} candidates with score > 0")
     return results
 
 
@@ -124,30 +111,18 @@ def reciprocal_rank_fusion(
 ) -> list[tuple[int, float]]:
     """
     Combine multiple ranked lists using Reciprocal Rank Fusion.
-
     Formula: score(chunk) = Σ 1 / (k + rank_i)
-    - k=60 prevents top-ranked items from dominating
-    - rank is 1-indexed (first result = rank 1)
-    - Works on chunk indices (not text) so deduplication is exact
-
-    Args:
-        ranked_lists: List of ranked result lists, each [(chunk_idx, score), ...]
-        k: RRF constant (defaults to settings value = 60)
-
-    Returns:
-        List of (chunk_idx, rrf_score) sorted by rrf_score descending.
     """
     if k is None:
         k = settings.rrf_k_constant
 
     rrf_scores: dict[int, float] = {}
-
     for ranked_list in ranked_lists:
         for rank, (chunk_idx, _) in enumerate(ranked_list, start=1):
             rrf_scores[chunk_idx] = rrf_scores.get(chunk_idx, 0.0) + 1.0 / (k + rank)
 
     fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    logger.debug(f"RRF fused {len(fused)} unique candidates")
+    logger.debug(f"[RETRIEVER] RRF: {len(fused)} unique candidates after fusion")
     return fused
 
 
@@ -159,26 +134,9 @@ def rerank(
     small_chunks: list[dict],
     top_k: int,
 ) -> list[dict]:
-    """
-    Cross-encoder reranking of RRF candidates.
-
-    WHY cross-encoder beats bi-encoder here:
-      Bi-encoder (FAISS): encodes query and chunk SEPARATELY → fast but less accurate
-      Cross-encoder: takes (query, chunk) as a PAIR → sees interaction → more accurate
-      Too slow for all chunks; perfect for top-20 candidates
-
-    Args:
-        query: Original user query (not preprocessed — reranker needs full context).
-        candidates: RRF results [(chunk_idx, rrf_score), ...].
-        small_chunks: Full list of small chunk dicts.
-        top_k: Final number of chunks to return.
-
-    Returns:
-        List of top-k small chunk dicts, sorted by cross-encoder score descending.
-    """
+    """Cross-encoder reranking of RRF candidates."""
     reranker = _get_reranker()
 
-    # Build (query, chunk_text) pairs for cross-encoder
     pairs = []
     valid_chunks = []
     for chunk_idx, _ in candidates:
@@ -189,13 +147,11 @@ def rerank(
     if not pairs:
         return []
 
-    scores = reranker.predict(pairs)  # Returns numpy array of relevance scores
-
-    # Combine with chunks and sort by score
+    scores = reranker.predict(pairs)
     scored = sorted(zip(scores, valid_chunks), key=lambda x: x[0], reverse=True)
     top_chunks = [chunk for _, chunk in scored[:top_k]]
 
-    logger.info(f"Reranker selected top-{len(top_chunks)} from {len(pairs)} candidates")
+    logger.debug(f"[RETRIEVER] Reranker: top-{len(top_chunks)} from {len(pairs)} candidates")
     return top_chunks
 
 
@@ -205,22 +161,7 @@ def get_parent_chunks(
     small_chunks: list[dict],
     large_chunks: dict[str, dict],
 ) -> list[dict]:
-    """
-    Swap small retrieved chunks for their large parent chunks.
-
-    This is the key parent-child trick:
-    - Retrieval found small chunks (precise match)
-    - We now look up each small chunk's parent_id
-    - Return the large parent chunks (rich context for LLM)
-    - Deduplicate: two small chunks from the same parent → return parent once
-
-    Args:
-        small_chunks: Top-k small chunks from reranker.
-        large_chunks: Full dict of large chunks keyed by chunk_id.
-
-    Returns:
-        Deduplicated list of large parent chunks.
-    """
+    """Swap small retrieved chunks for their large parent chunks (deduplicated)."""
     seen_parent_ids = set()
     parents = []
 
@@ -232,7 +173,7 @@ def get_parent_chunks(
                 parents.append(parent)
                 seen_parent_ids.add(parent_id)
 
-    logger.debug(f"Parent lookup: {len(small_chunks)} small → {len(parents)} unique parents")
+    logger.debug(f"[RETRIEVER] Parent lookup: {len(small_chunks)} small → {len(parents)} parents")
     return parents
 
 
@@ -245,41 +186,72 @@ def hybrid_retrieve(
     bm25_index: BM25Okapi,
     small_chunks: list[dict],
     large_chunks: dict[str, dict],
+    override_rerank_top_k: int | None = None,
+    return_small_chunks: bool = False,
 ) -> list[dict]:
     """
     Full hybrid retrieval pipeline for a single document index.
 
-    Runs: BM25 + FAISS → RRF → rerank → parent lookup
-
     Args:
-        query: Original user query string.
-        query_vector: Pre-computed 768-dim query embedding.
-        faiss_index: Document's FAISS index.
-        bm25_index: Document's BM25 index.
-        small_chunks: Document's small chunk list.
-        large_chunks: Document's large chunk dict.
+        override_rerank_top_k: If set, overrides settings.rerank_top_k for the
+            per-doc rerank step. Used by query.py to cap per-doc contributions
+            (e.g. top-2) before a global cross-encoder rerank across all docs.
 
-    Returns:
-        List of large parent chunks (final context for LLM).
+        return_small_chunks: If True, skips the parent lookup step and returns
+            small chunks (300 chars) instead of parent chunks (1200 chars).
+            Used by query.py in multi-doc mode so the global cross-encoder rerank
+            gets short passages — what ms-marco was trained on. Parent lookup
+            is then done once in query.py after global rerank.
+            If False (default), returns parent chunks as usual (single-doc path).
+
+    Logs a timing breakdown at INFO level:
+      [RETRIEVER] dense+sparse(parallel): 28ms | rrf: 1ms | rerank: 190ms | TOTAL: 219ms
     """
-    # 1. Dense retrieval
-    dense_results = dense_search(
-        query_vector, faiss_index, small_chunks, settings.faiss_top_k
-    )
+    timings: dict[str, float] = {}
+    pipeline_start = time.perf_counter()
 
-    # 2. Sparse retrieval
-    sparse_results = sparse_search(
-        query, bm25_index, small_chunks, settings.bm25_top_k
-    )
+    # ── 1 & 2. Dense + Sparse in PARALLEL ─────────────────────────────────
+    t_search_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="search") as pool:
+        future_dense = pool.submit(
+            dense_search, query_vector, faiss_index, small_chunks, settings.faiss_top_k
+        )
+        future_sparse = pool.submit(
+            sparse_search, query, bm25_index, small_chunks, settings.bm25_top_k
+        )
+        dense_results = future_dense.result()
+        sparse_results = future_sparse.result()
 
-    # 3. RRF fusion
+    timings["dense+sparse(parallel)"] = (time.perf_counter() - t_search_start) * 1000
+
+    # ── 3. RRF fusion ──────────────────────────────────────────────────────
+    t0 = time.perf_counter()
     fused = reciprocal_rank_fusion([dense_results, sparse_results])
-    top_candidates = fused[:20]  # Take top-20 into reranker
+    top_candidates = fused[:20]
+    timings["rrf"] = (time.perf_counter() - t0) * 1000
 
-    # 4. Cross-encoder rerank → top-4
-    top_small = rerank(query, top_candidates, small_chunks, settings.rerank_top_k)
+    # ── 4. Cross-encoder rerank ────────────────────────────────────────────
+    t0 = time.perf_counter()
+    final_k = override_rerank_top_k if override_rerank_top_k is not None else settings.rerank_top_k
+    top_small = rerank(query, top_candidates, small_chunks, final_k)
+    timings["rerank"] = (time.perf_counter() - t0) * 1000
 
-    # 5. Parent chunk lookup
+    # ── 5. Parent chunk lookup (skipped if return_small_chunks=True) ───────
+    if return_small_chunks:
+        # Caller (query.py multi-doc) will do global rerank on these small
+        # chunks first, then call get_parent_chunks() itself after.
+        timings["parent_lookup"] = 0.0
+        timings["TOTAL"] = (time.perf_counter() - pipeline_start) * 1000
+        timing_str = " | ".join(f"{k}: {v:.0f}ms" for k, v in timings.items())
+        logger.info(f"[RETRIEVER] {timing_str}")
+        return top_small
+
+    t0 = time.perf_counter()
     context_chunks = get_parent_chunks(top_small, large_chunks)
+    timings["parent_lookup"] = (time.perf_counter() - t0) * 1000
+
+    timings["TOTAL"] = (time.perf_counter() - pipeline_start) * 1000
+    timing_str = " | ".join(f"{k}: {v:.0f}ms" for k, v in timings.items())
+    logger.info(f"[RETRIEVER] {timing_str}")
 
     return context_chunks

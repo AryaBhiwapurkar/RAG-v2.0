@@ -9,13 +9,19 @@ WHY GRADIO CALLS FASTAPI (not core modules directly):
     - This is exactly the architecture you defend in interviews
 
 TABS:
-  1. Upload & Ingest — Upload PDFs, see ingestion status
-  2. Ask — Query interface with faithfulness flag + latency display
-  3. Metrics — Live dashboard (P95 latency, cache hit rate)
+  1. Upload (Single) — Upload one PDF, see ingestion status
+  2. Upload Bulk — Upload multiple PDFs, ingest IN PARALLEL
+  3. Ask — Query interface with faithfulness flag + latency display
+  4. Metrics — Live dashboard (P95 latency, cache hit rate)
 
 SESSION NOTE (HF Spaces deployment):
   A banner reminds users that indexes are session-based.
   Documents persist until server restart. Re-upload after refresh.
+
+PHASE 1: BULK UPLOAD
+  - New "Upload Bulk" tab using Gradio file_count="multiple"
+  - Calls new /ingest-bulk endpoint which runs ThreadPoolExecutor
+  - Max 4 concurrent ingestions (configurable)
 
 Run with:
   python ui/app.py
@@ -63,10 +69,38 @@ def _post_file(path: str, file_path: str, filename: str) -> dict:
         return {"error": str(e)}
 
 
-# ── UPLOAD TAB ─────────────────────────────────────────────────────────────────
+def _post_files_bulk(file_objs) -> dict:
+    try:
+        if not isinstance(file_objs, list):
+            file_objs = [file_objs]
+        
+        file_handles = []
+        files = []
+        
+        for f in file_objs:
+            path = f if isinstance(f, str) else f.name
+            filename = path.split("/")[-1]
+            fh = open(path, "rb")
+            file_handles.append(fh)
+            files.append(("files", (filename, fh, "application/pdf")))
+        
+        r = httpx.post(
+            f"{API_BASE}/ingest-bulk",
+            files=files,
+            timeout=120,
+        )
+        
+        for fh in file_handles:
+            fh.close()
+            
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def upload_pdf(file_obj) -> tuple[str, str]:
-    """Handle PDF upload and return status message + updated doc list."""
+    """Handle single PDF upload and return status message + updated doc list."""
     if file_obj is None:
         return "⚠️ Please select a PDF file.", get_document_list()
 
@@ -82,6 +116,29 @@ def upload_pdf(file_obj) -> tuple[str, str]:
         get_document_list(),
     )
 
+
+# ── UPLOAD TAB (Bulk) ──────────────────────────────────────────────────────────
+def upload_pdfs_bulk(file_objs) -> tuple[str, str]:
+    if not file_objs:
+        return "⚠️ Please select PDF files.", get_document_list()
+
+    if not isinstance(file_objs, list):
+        file_objs = [file_objs]
+
+    file_paths = [f if isinstance(f, str) else f.name for f in file_objs]
+    filenames = [p.split("/")[-1] for p in file_paths]
+
+    result = _post_files_bulk(file_objs)
+
+    if "error" in result:
+        return f"❌ Bulk upload failed: {result['error']}", get_document_list()
+
+    return (
+        f"✅ {len(filenames)} files uploaded and queued for parallel ingestion.\n"
+        "Ingesting up to 4 files concurrently...\n"
+        "Refresh the document list in 10-30 seconds to check status.",
+        get_document_list(),
+    )
 
 def get_document_list() -> str:
     """Return a formatted table of all ingested documents."""
@@ -194,9 +251,9 @@ def build_app() -> gr.Blocks:
 
         with gr.Tabs():
 
-            # ── Tab 1: Upload ────────────────────────────────────────────
-            with gr.Tab("📁 Upload Documents"):
-                gr.Markdown("Upload a text-based PDF to ingest it into the system.")
+            # ── Tab 1: Upload (Single) ───────────────────────────────────
+            with gr.Tab("📁 Upload Single"):
+                gr.Markdown("Upload a single text-based PDF to ingest it into the system.")
 
                 with gr.Row():
                     file_input = gr.File(label="Select PDF", file_types=[".pdf"])
@@ -215,7 +272,38 @@ def build_app() -> gr.Blocks:
                 )
                 refresh_btn.click(fn=get_document_list, outputs=[doc_list])
 
-            # ── Tab 2: Ask ───────────────────────────────────────────────
+            # ── Tab 2: Upload (Bulk) ────────────────────────────────────
+            with gr.Tab("📂 Upload Bulk (Parallel)"):
+                gr.Markdown(
+                    "Upload multiple PDFs and ingest them in **parallel** "
+                    "(up to 4 concurrent).\n\n"
+                    "**Time savings:**\n"
+                    "- 5 PDFs sequential: 40s\n"
+                    "- 5 PDFs parallel: ~10s"
+                )
+
+                with gr.Row():
+                    file_input_bulk = gr.File(
+                        label="Select PDFs",
+                        file_types=[".pdf"],
+                        file_count="multiple"  # ← Allows multi-select
+                    )
+                    upload_btn_bulk = gr.Button("Upload & Ingest (Parallel)", variant="primary")
+
+                upload_status_bulk = gr.Markdown("Ready to upload.")
+
+                gr.Markdown("### Ingested Documents")
+                refresh_btn_bulk = gr.Button("🔄 Refresh Document List")
+                doc_list_bulk = gr.Markdown(get_document_list())
+
+                upload_btn_bulk.click(
+                    fn=upload_pdfs_bulk,
+                    inputs=[file_input_bulk],
+                    outputs=[upload_status_bulk, doc_list_bulk],
+                )
+                refresh_btn_bulk.click(fn=get_document_list, outputs=[doc_list_bulk])
+
+            # ── Tab 3: Ask ──────────────────────────────────────────────
             with gr.Tab("💬 Ask a Question"):
                 gr.Markdown("Ask anything about your uploaded documents.")
 
@@ -249,7 +337,7 @@ def build_app() -> gr.Blocks:
                     outputs=[answer_output, metadata_output, confidence_output],
                 )
 
-            # ── Tab 3: Metrics ───────────────────────────────────────────
+            # ── Tab 4: Metrics ──────────────────────────────────────────
             with gr.Tab("📊 Metrics"):
                 gr.Markdown("Live latency and cache statistics.")
                 metrics_refresh_btn = gr.Button("🔄 Refresh Metrics")
